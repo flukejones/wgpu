@@ -49,7 +49,7 @@ use crate::{
     resource::{
         self, Buffer, ExternalTexture, Fallible, Labeled, ParentDevice, QuerySet,
         RawResourceAccess, ResourceState, Sampler, StagingBuffer, Texture, TextureView,
-        TextureViewNotRenderableReason, Tlas, TrackingData,
+        TextureViewNotRenderableReason, Tlas, Trackable, TrackingData,
     },
     resource_log,
     snatch::{SnatchGuard, SnatchLock, Snatchable},
@@ -3567,6 +3567,23 @@ impl Device {
         }
 
         used.optimize();
+
+        // Bind-group init actions are reads; no writes or discards occur between them.
+        let texture_init_key = |action: &TextureInitTrackerAction| {
+            (
+                action.texture.tracker_index(),
+                action.range.mip_range.start,
+                action.range.mip_range.end,
+                action.range.layer_range.start,
+                action.range.layer_range.end,
+                match action.kind {
+                    MemoryInitKind::ImplicitlyInitialized => 0,
+                    MemoryInitKind::NeedsInitializedMemory => 1,
+                },
+            )
+        };
+        texture_init_actions.sort_unstable_by_key(texture_init_key);
+        texture_init_actions.dedup_by_key(|action| texture_init_key(action));
 
         hal_entries.sort_by_key(|entry| entry.binding);
         for (a, b) in hal_entries.iter().zip(hal_entries.iter().skip(1)) {

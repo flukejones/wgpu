@@ -147,13 +147,16 @@ impl TextureViewBindGroupState {
         Self { views: Vec::new() }
     }
 
-    /// Optimize the texture bind group state by sorting it by ID.
+    /// Sort by parent texture and retain each distinct view/usage pair once.
     ///
     /// When this list of states is merged into a tracker, the memory
     /// accesses will be in a constant ascending order.
     pub(crate) fn optimize(&mut self) {
+        self.views.sort_unstable_by_key(|(view, usage)| {
+            (view.parent.tracker_index(), Arc::as_ptr(view), usage.bits())
+        });
         self.views
-            .sort_unstable_by_key(|(view, _)| view.parent.tracker_index());
+            .dedup_by(|(a, a_usage), (b, b_usage)| Arc::ptr_eq(a, b) && a_usage == b_usage);
     }
 
     /// Adds the given resource with the given state.
