@@ -23,11 +23,10 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{ops::Range, ptr::NonNull, sync::atomic};
+use core::{mem::size_of, ops::Range, ptr::NonNull, sync::atomic};
 use smallvec::SmallVec;
 
-// has to match `Temp::binding_sizes`
-const WORD_SIZE: usize = 4;
+const WORD_SIZE: usize = size_of::<u32>();
 
 impl Default for super::CommandState {
     fn default() -> Self {
@@ -355,8 +354,9 @@ impl super::CommandEncoder {
                         binding: *binding_location,
                     };
                     if let Some(size) = binding_size {
-                        self.state.storage_buffer_length_map.insert((br, 0), *size);
-                        changes_sizes_buffer = true;
+                        changes_sizes_buffer |=
+                            self.state.storage_buffer_length_map.insert((br, 0), *size)
+                                != Some(*size);
                     }
                 }
                 super::BufferLikeResource::StorageBindingArray {
@@ -372,10 +372,11 @@ impl super::CommandEncoder {
                         binding: *binding_location,
                     };
                     for &(array_idx, size) in array_element_sizes {
-                        self.state
+                        changes_sizes_buffer |= self
+                            .state
                             .storage_buffer_length_map
-                            .insert((br, array_idx), size);
-                        changes_sizes_buffer = true;
+                            .insert((br, array_idx), size)
+                            != Some(size);
                     }
                 }
                 super::BufferLikeResource::AccelerationStructure(ptr) => {
@@ -386,15 +387,18 @@ impl super::CommandEncoder {
             }
         }
         if changes_sizes_buffer {
-            if let Some((index, sizes)) = self
-                .state
-                .make_sizes_buffer_update(encoder.stage(), &mut self.temp.binding_sizes)
-            {
-                let bytes_ptr = NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap();
-                let length = sizes.len() * WORD_SIZE;
-                let index = index as _;
-                encoder.set_bytes(bytes_ptr, length, index);
+            for sizes in self.temp.binding_sizes.iter_mut() {
+                sizes.dirty = true;
             }
+        }
+        if let Some((index, sizes)) = self.state.make_sizes_buffer_update(
+            encoder.stage(),
+            &mut self.temp.binding_sizes[encoder.stage()],
+        ) {
+            let bytes_ptr = NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap();
+            let length = sizes.len() * WORD_SIZE;
+            let index = index as _;
+            encoder.set_bytes(bytes_ptr, length, index);
         }
         let samplers = match encoder.stage() {
             S::Vertex => group.counters.vs.samplers,
@@ -443,11 +447,16 @@ impl super::CommandState {
     fn make_sizes_buffer_update<'a>(
         &self,
         stage: naga::ShaderStage,
-        result_sizes: &'a mut Vec<u32>,
+        cache: &'a mut super::BufferSizes,
     ) -> Option<(u32, &'a [u32])> {
+        if !cache.dirty {
+            return None;
+        }
+        cache.dirty = false;
         let stage_info = &self.stage_infos[stage];
         let slot = stage_info.sizes_slot?;
 
+        let result_sizes = &mut cache.values;
         result_sizes.clear();
         result_sizes.extend(stage_info.sized_bindings.iter().map(|(br, array_idx)| {
             self.storage_buffer_length_map
@@ -1273,6 +1282,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
     }
 
     unsafe fn set_render_pipeline(&mut self, pipeline: &super::RenderPipeline) {
+        self.temp.binding_sizes.vs.dirty = true;
+        self.temp.binding_sizes.fs.dirty = true;
+        self.temp.binding_sizes.ts.dirty = true;
+        self.temp.binding_sizes.ms.dirty = true;
         self.state.raw_primitive_type = pipeline.raw_primitive_type;
         match pipeline.vs_info {
             Some(ref info) => self.state.stage_infos.vs.assign_from(info),
@@ -1309,10 +1322,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
         }
 
         if pipeline.vs_info.is_some() {
-            if let Some((index, sizes)) = self
-                .state
-                .make_sizes_buffer_update(naga::ShaderStage::Vertex, &mut self.temp.binding_sizes)
-            {
+            if let Some((index, sizes)) = self.state.make_sizes_buffer_update(
+                naga::ShaderStage::Vertex,
+                &mut self.temp.binding_sizes.vs,
+            ) {
                 unsafe {
                     encoder.setVertexBytes_length_atIndex(
                         NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
@@ -1323,10 +1336,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
             }
         }
         if pipeline.fs_info.is_some() {
-            if let Some((index, sizes)) = self
-                .state
-                .make_sizes_buffer_update(naga::ShaderStage::Fragment, &mut self.temp.binding_sizes)
-            {
+            if let Some((index, sizes)) = self.state.make_sizes_buffer_update(
+                naga::ShaderStage::Fragment,
+                &mut self.temp.binding_sizes.fs,
+            ) {
                 unsafe {
                     encoder.setFragmentBytes_length_atIndex(
                         NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
@@ -1360,7 +1373,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
             }
             if let Some((index, sizes)) = self
                 .state
-                .make_sizes_buffer_update(naga::ShaderStage::Task, &mut self.temp.binding_sizes)
+                .make_sizes_buffer_update(naga::ShaderStage::Task, &mut self.temp.binding_sizes.ts)
             {
                 unsafe {
                     encoder.setObjectBytes_length_atIndex(
@@ -1379,7 +1392,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
             // behave this way.
             if let Some((index, sizes)) = self
                 .state
-                .make_sizes_buffer_update(naga::ShaderStage::Mesh, &mut self.temp.binding_sizes)
+                .make_sizes_buffer_update(naga::ShaderStage::Mesh, &mut self.temp.binding_sizes.ms)
             {
                 unsafe {
                     encoder.setMeshBytes_length_atIndex(
@@ -1422,18 +1435,23 @@ impl crate::CommandEncoder for super::CommandEncoder {
         };
 
         let buffer_size = binding.resolve_size();
-        if buffer_size > 0 {
-            self.state.vertex_buffer_size_map.insert(
-                buffer_index,
-                core::num::NonZeroU64::new(buffer_size).unwrap(),
-            );
-        } else {
-            self.state.vertex_buffer_size_map.remove(&buffer_index);
+        let changed = match wgt::BufferSize::new(buffer_size) {
+            Some(size) => {
+                self.state.vertex_buffer_size_map.insert(buffer_index, size) != Some(size)
+            }
+            None => self
+                .state
+                .vertex_buffer_size_map
+                .remove(&buffer_index)
+                .is_some(),
+        };
+        if changed || self.state.stage_infos.vs.sizes_slot.map(u32::from) == Some(buffer_index) {
+            self.temp.binding_sizes.vs.dirty = true;
         }
 
         if let Some((index, sizes)) = self
             .state
-            .make_sizes_buffer_update(naga::ShaderStage::Vertex, &mut self.temp.binding_sizes)
+            .make_sizes_buffer_update(naga::ShaderStage::Vertex, &mut self.temp.binding_sizes.vs)
         {
             unsafe {
                 encoder.setVertexBytes_length_atIndex(
@@ -1760,6 +1778,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
     }
 
     unsafe fn set_compute_pipeline(&mut self, pipeline: &super::ComputePipeline) {
+        self.temp.binding_sizes.cs.dirty = true;
         let previous_sizes =
             core::mem::take(&mut self.state.stage_infos.cs.work_group_memory_sizes);
         self.state.stage_infos.cs.assign_from(&pipeline.cs_info);
@@ -1769,7 +1788,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
         if let Some((index, sizes)) = self
             .state
-            .make_sizes_buffer_update(naga::ShaderStage::Compute, &mut self.temp.binding_sizes)
+            .make_sizes_buffer_update(naga::ShaderStage::Compute, &mut self.temp.binding_sizes.cs)
         {
             unsafe {
                 encoder.setBytes_length_atIndex(

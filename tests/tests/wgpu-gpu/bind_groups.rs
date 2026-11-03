@@ -1,9 +1,16 @@
 use std::num::NonZeroU64;
 
-use wgpu::{util::DeviceExt, BufferUsages, PollType};
-use wgpu_test::{
-    gpu_test, FailureCase, GpuTestConfiguration, GpuTestInitializer, TestParameters, TestingContext,
+use wgpu::{
+    util::{BufferInitDescriptor, DeviceExt},
+    BufferUsages, PollType,
 };
+use wgpu_test::{
+    gpu_test, image::ReadbackBuffers, FailureCase, GpuTestConfiguration, GpuTestInitializer,
+    TestParameters, TestingContext,
+};
+
+const UNUSED_VERTEX_SLOT: u32 = 15;
+const EXTRA_VERTEX_UNIFORMS: u32 = 13;
 
 pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
     vec.extend([
@@ -13,6 +20,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         BIND_GROUP_NONFILTERING_LAYOUT_MAG_SAMPLER,
         BIND_GROUP_NONFILTERING_LAYOUT_MIPMAP_SAMPLER,
         BIND_GROUP_WITH_MAX_BINDING_INDEX,
+        STORAGE_ARRAY_LENGTHS_ACROSS_STAGES_AND_PIPELINES,
     ]);
 }
 
@@ -386,3 +394,210 @@ static BIND_GROUP_WITH_MAX_BINDING_INDEX: GpuTestConfiguration = GpuTestConfigur
             &test_value.to_le_bytes()
         );
     });
+#[gpu_test]
+static STORAGE_ARRAY_LENGTHS_ACROSS_STAGES_AND_PIPELINES: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(
+            TestParameters::default()
+                .downlevel_flags(wgpu::DownlevelFlags::VERTEX_STORAGE)
+                .limits(wgpu::Limits {
+                    max_vertex_buffers: UNUSED_VERTEX_SLOT + 1,
+                    max_uniform_buffers_per_shader_stage: EXTRA_VERTEX_UNIFORMS,
+                    ..Default::default()
+                }),
+        )
+        .run_async(storage_array_lengths_across_stages_and_pipelines);
+
+async fn storage_array_lengths_across_stages_and_pipelines(ctx: TestingContext) {
+    let module = ctx
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+            @group(0) @binding(0) var<storage, read> first: array<u32>;
+            @group(0) @binding(1) var<storage, read> second: array<u32>;
+
+            struct VertexOutput {
+                @builtin(position) position: vec4f,
+                @location(0) @interpolate(flat) length: u32,
+            }
+
+            fn vertex_output(index: u32, length: u32) -> VertexOutput {
+                let positions = array(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+                return VertexOutput(vec4f(positions[index], 0.0, 1.0), length);
+            }
+
+            @vertex fn vertex_first(@builtin(vertex_index) index: u32) -> VertexOutput {
+                return vertex_output(index, arrayLength(&first));
+            }
+            @vertex fn vertex_second(@builtin(vertex_index) index: u32) -> VertexOutput {
+                return vertex_output(index, arrayLength(&second));
+            }
+            @fragment fn fragment_first(input: VertexOutput) -> @location(0) vec4u {
+                return vec4u(input.length, arrayLength(&first), first[0], 1u);
+            }
+            @fragment fn fragment_second(input: VertexOutput) -> @location(0) vec4u {
+                return vec4u(input.length, arrayLength(&second), second[0], 1u);
+            }
+            "#
+                .into(),
+            ),
+        });
+    // Fifteen VS bindings place Metal's sizes table at the unused vertex slot.
+    let entries: Vec<_> = (0..2 + EXTRA_VERTEX_UNIFORMS)
+        .map(|binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: if binding < 2 {
+                wgpu::ShaderStages::VERTEX_FRAGMENT
+            } else {
+                wgpu::ShaderStages::VERTEX
+            },
+            ty: wgpu::BindingType::Buffer {
+                ty: if binding < 2 {
+                    wgpu::BufferBindingType::Storage { read_only: true }
+                } else {
+                    wgpu::BufferBindingType::Uniform
+                },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        })
+        .collect();
+    let layout = ctx
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &entries,
+        });
+    let pipeline_layout = ctx
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+    let pipelines = [
+        ("vertex_first", "fragment_first"),
+        ("vertex_second", "fragment_second"),
+    ]
+    .map(|(vertex, fragment)| {
+        ctx.device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some(vertex),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(fragment),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba32Uint,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+    });
+    let inputs = [&[17u32][..], &[29, 31, 37], &[41, 43, 47], &[53, 59]].map(|contents| {
+        ctx.device.create_buffer_init(&BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(contents),
+            usage: BufferUsages::STORAGE,
+        })
+    });
+    let unused_buffers = [0xffff_fffcu32, 0xffff_fff8].map(|value| {
+        ctx.device.create_buffer_init(&BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&value),
+            usage: BufferUsages::VERTEX | BufferUsages::UNIFORM,
+        })
+    });
+    let groups = [0, 1, 2].map(|first| {
+        let entries: Vec<_> = (0..2 + EXTRA_VERTEX_UNIFORMS)
+            .map(|binding| {
+                let buffer = match binding {
+                    0 => &inputs[first],
+                    1 => &inputs[3],
+                    _ => &unused_buffers[0],
+                };
+                wgpu::BindGroupEntry {
+                    binding,
+                    resource: buffer.as_entire_binding(),
+                }
+            })
+            .collect();
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &entries,
+        })
+    });
+    let output = ctx.device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 5,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Uint,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = output.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    {
+        let attachments = [Some(wgpu::RenderPassColorAttachment {
+            view: &view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &attachments,
+            ..Default::default()
+        });
+        for (pixel, (pipeline, group)) in [(0, 0), (0, 1), (0, 2), (1, 2), (0, 2)]
+            .into_iter()
+            .enumerate()
+        {
+            pass.set_viewport(pixel as f32, 0.0, 1.0, 1.0, 0.0, 1.0);
+            pass.set_pipeline(&pipelines[pipeline]);
+            pass.set_bind_group(0, &groups[group], &[]);
+            pass.set_vertex_buffer(UNUSED_VERTEX_SLOT, unused_buffers[pixel % 2].slice(..));
+            pass.draw(0..3, 0..1);
+        }
+    }
+    let readback = ReadbackBuffers::new(&ctx.device, &output);
+    readback.copy_from(&ctx.device, &mut encoder, &output);
+    ctx.queue.submit(Some(encoder.finish()));
+    let expected: [[u32; 4]; 5] = [
+        [1, 1, 17, 1],
+        [3, 3, 29, 1],
+        [3, 3, 41, 1],
+        [2, 2, 53, 1],
+        [3, 3, 41, 1],
+    ];
+    readback
+        .assert_buffer_contents(&ctx, bytemuck::cast_slice(&expected))
+        .await;
+}

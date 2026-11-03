@@ -973,6 +973,22 @@ impl<T> ops::Index<naga::ShaderStage> for MultiStageData<T> {
     }
 }
 
+impl<T> ops::IndexMut<naga::ShaderStage> for MultiStageData<T> {
+    fn index_mut(&mut self, stage: naga::ShaderStage) -> &mut T {
+        match stage {
+            naga::ShaderStage::Vertex => &mut self.vs,
+            naga::ShaderStage::Fragment => &mut self.fs,
+            naga::ShaderStage::Compute => &mut self.cs,
+            naga::ShaderStage::Task => &mut self.ts,
+            naga::ShaderStage::Mesh => &mut self.ms,
+            naga::ShaderStage::RayGeneration
+            | naga::ShaderStage::AnyHit
+            | naga::ShaderStage::ClosestHit
+            | naga::ShaderStage::Miss => unimplemented!(),
+        }
+    }
+}
+
 impl<T> MultiStageData<T> {
     fn map_ref<Y>(&self, fun: impl Fn(&T) -> Y) -> MultiStageData<Y> {
         MultiStageData {
@@ -1303,8 +1319,14 @@ struct IndexState {
 }
 
 #[derive(Default)]
+struct BufferSizes {
+    values: Vec<u32>,
+    dirty: bool,
+}
+
+#[derive(Default)]
 struct Temp {
-    binding_sizes: Vec<u32>,
+    binding_sizes: MultiStageData<BufferSizes>,
 }
 
 // Any state in this struct that may be dirty after an abandoned encoding must
