@@ -10,12 +10,14 @@ use crate::device::{Device, DeviceError, MissingFeatures};
 use crate::pipeline::LateSizedBufferGroup;
 use crate::resource::{
     DestroyedResourceError, InvalidOrDestroyedResourceError, Labeled, ParentDevice, QuerySet,
+    Trackable,
 };
-use crate::track::{ResourceUsageCompatibilityError, UsageScope};
-use crate::{api_log, binding_model};
+use crate::track::{ResourceUsageCompatibilityError, TrackerIndex, UsageScope};
+use crate::{api_log, binding_model, FastHashMap};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::str;
+use core::{mem, str};
+use hashbrown::hash_map::Entry;
 use thiserror::Error;
 use wgt::DynamicOffset;
 
@@ -115,6 +117,9 @@ pub(crate) struct PassState<'scope, 'snatch_guard, 'cmd_enc> {
 
     pub(crate) binder: Binder,
 
+    /// Render-only usage merges and whether initialization was registered in this pass.
+    pub(crate) render_bind_groups: Option<FastHashMap<TrackerIndex, bool>>,
+
     pub(crate) temp_offsets: Vec<u32>,
 
     pub(crate) dynamic_offset_count: usize,
@@ -131,7 +136,6 @@ pub(crate) fn set_bind_group<E>(
     index: u32,
     num_dynamic_offsets: usize,
     bind_group: Option<Arc<BindGroup>>,
-    merge_bind_groups: bool,
 ) -> Result<(), E>
 where
     E: From<DeviceError>
@@ -173,12 +177,13 @@ where
 
         bind_group.validate_dynamic_bindings(index, &state.temp_offsets)?;
 
-        if merge_bind_groups {
-            // Merge the bind group's resources into the tracker. We only do this
-            // for render passes. For compute passes it is done per dispatch in
-            // [`flush_bindings`].
-            unsafe {
-                state.scope.merge_bind_group(&bind_group.used)?;
+        if let Some(groups) = state.render_bind_groups.as_mut() {
+            if let Entry::Vacant(entry) = groups.entry(bind_group.tracker_index()) {
+                // Render usages accumulate for the entire pass; compute usages are per dispatch.
+                unsafe {
+                    state.scope.merge_bind_group(&bind_group.used)?;
+                }
+                entry.insert(false);
             }
         }
         //Note: stateless trackers are not merged: the lifetime reference
@@ -214,22 +219,33 @@ pub(super) fn flush_bindings_helper(
     let pipeline_layout = state.binder.pipeline_layout.as_ref().unwrap();
 
     for (i, bind_group, dynamic_offsets) in entries {
-        state.base.buffer_memory_init_actions.extend(
-            bind_group.buffer_init_actions.iter().filter_map(|action| {
-                action
-                    .buffer
-                    .initialization_status
-                    .read()
-                    .check_action(action)
-            }),
-        );
-        for action in bind_group.texture_init_actions.iter() {
-            state.pending_discard_init_fixups.extend(
-                state
-                    .base
-                    .texture_memory_actions
-                    .register_init_action(action, None),
+        let needs_init = match state.render_bind_groups.as_mut() {
+            Some(groups) => {
+                let initialized = groups
+                    .get_mut(&bind_group.tracker_index())
+                    .expect("render bind groups are tracked when assigned");
+                !mem::replace(initialized, true)
+            }
+            None => true,
+        };
+        if needs_init {
+            state.base.buffer_memory_init_actions.extend(
+                bind_group.buffer_init_actions.iter().filter_map(|action| {
+                    action
+                        .buffer
+                        .initialization_status
+                        .read()
+                        .check_action(action)
+                }),
             );
+            for action in bind_group.texture_init_actions.iter() {
+                state.pending_discard_init_fixups.extend(
+                    state
+                        .base
+                        .texture_memory_actions
+                        .register_init_action(action, None),
+                );
+            }
         }
 
         let used_resource = bind_group
