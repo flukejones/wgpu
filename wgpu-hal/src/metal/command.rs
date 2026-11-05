@@ -1151,13 +1151,17 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 group_index,
                 group,
             );
-            // Call useResource on all textures and buffers used indirectly so they are alive
-            for (resource, use_info) in group.resources_to_use.iter() {
-                encoder.useResource_usage_stages(
-                    unsafe { resource.as_ref() },
-                    use_info.uses,
-                    use_info.stages,
-                );
+            for batch in &group.resources_to_use {
+                // SAFETY: the batch contains exactly this many initialized resource pointers.
+                // Bind-group resources remain alive through command execution.
+                unsafe {
+                    encoder.useResources_count_usage_stages(
+                        NonNull::from(batch.resources.as_slice()).cast(),
+                        batch.resources.len(),
+                        batch.info.uses,
+                        batch.info.stages,
+                    );
+                }
             }
         }
         if let Some(encoder) = compute_encoder {
@@ -1182,12 +1186,19 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 group_index,
                 group,
             );
-            // Call useResource on all textures and buffers used indirectly so they are alive
-            for (resource, use_info) in group.resources_to_use.iter() {
-                if !use_info.visible_in_compute {
+            for batch in &group.resources_to_use {
+                if !batch.info.visible_in_compute {
                     continue;
                 }
-                encoder.useResource_usage(unsafe { resource.as_ref() }, use_info.uses);
+                // SAFETY: the batch contains exactly this many initialized resource pointers.
+                // Bind-group resources remain alive through command execution.
+                unsafe {
+                    encoder.useResources_count_usage(
+                        NonNull::from(batch.resources.as_slice()).cast(),
+                        batch.resources.len(),
+                        batch.info.uses,
+                    );
+                }
             }
         }
     }

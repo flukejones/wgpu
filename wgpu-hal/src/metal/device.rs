@@ -24,7 +24,7 @@ use objc2_metal::{
 };
 use parking_lot::{Condvar, Mutex, RwLock};
 
-use super::{adapter::MAX_BUFFERS, conv, PassthroughShader, ShaderModuleSource};
+use super::{adapter::MAX_BUFFERS, conv, HashMap, PassthroughShader, ShaderModuleSource};
 use crate::{auxil::map_naga_stage, DropCallback, DropGuard, TlasInstance};
 
 type DeviceResult<T> = Result<T, crate::DeviceError>;
@@ -993,6 +993,7 @@ impl crate::Device for super::Device {
     ) -> DeviceResult<super::BindGroup> {
         autoreleasepool(|_| {
             let mut bg = super::BindGroup::default();
+            let mut resources_to_use = HashMap::<_, super::UseResourceInfo>::default();
             for (&stage, counter) in super::NAGA_STAGES.iter().zip(bg.counters.iter_mut()) {
                 let stage_bit = map_naga_stage(stage);
                 let mut dynamic_offsets_count = 0u32;
@@ -1041,8 +1042,7 @@ impl crate::Device for super::Device {
                                 for (idx, tex) in textures.iter().enumerate() {
                                     resource_ids[idx] = tex.view.raw.gpuResourceID();
 
-                                    let use_info = bg
-                                        .resources_to_use
+                                    let use_info = resources_to_use
                                         .entry(tex.view.as_raw().cast())
                                         .or_default();
                                     use_info.stages |= stages;
@@ -1084,8 +1084,7 @@ impl crate::Device for super::Device {
                                         }
                                     }
 
-                                    let use_info = bg
-                                        .resources_to_use
+                                    let use_info = resources_to_use
                                         .entry(source.buffer.as_raw().cast())
                                         .or_default();
                                     use_info.stages |= stages;
@@ -1107,8 +1106,7 @@ impl crate::Device for super::Device {
                                 {
                                     resource_ids[idx] = acceleration_structure.raw.gpuResourceID();
 
-                                    let use_info = bg
-                                        .resources_to_use
+                                    let use_info = resources_to_use
                                         .entry(acceleration_structure.as_raw().cast())
                                         .or_default();
                                     use_info.stages |= stages;
@@ -1255,6 +1253,14 @@ impl crate::Device for super::Device {
                 }
             }
 
+            let mut batches = HashMap::<_, Vec<_>>::default();
+            for (resource, info) in resources_to_use {
+                batches.entry(info).or_default().push(resource);
+            }
+            bg.resources_to_use = batches
+                .into_iter()
+                .map(|(info, resources)| super::ResourceBatch { info, resources })
+                .collect();
             self.counters.bind_groups.add(1);
 
             Ok(bg)

@@ -268,6 +268,8 @@ async fn binding_array_sampled_textures(ctx: TestingContext, partially_bound: bo
         enable wgpu_binding_array;
         @group(0) @binding(0)
         var textures: binding_array<texture_2d<f32>>;
+        @group(0) @binding(1)
+        var vertex_textures: binding_array<texture_2d<f32>>;
 
         @vertex
         fn vertMain(@builtin(vertex_index) id: u32) -> @builtin(position) vec4f {
@@ -277,7 +279,7 @@ async fn binding_array_sampled_textures(ctx: TestingContext, partially_bound: bo
                 vec2f(-1.0, 3.0)
             );
 
-            return vec4<f32>(positions[id], 0.0, 1.0);
+            return vec4<f32>(positions[id], 0.0, textureLoad(vertex_textures[0], vec2u(0), 0).a);
         }
 
         @fragment
@@ -366,16 +368,28 @@ async fn binding_array_sampled_textures(ctx: TestingContext, partially_bound: bo
         .device
         .create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("Bind Group Layout"),
-            entries: &[BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: false },
-                    view_dimension: TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: false },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: Some(NonZeroU32::new(count).unwrap()),
                 },
-                count: Some(NonZeroU32::new(count).unwrap()),
-            }],
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::VERTEX,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: false },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: NonZeroU32::new(1),
+                },
+            ],
         });
 
     let input_view_references: Vec<_> = input_views.iter().collect();
@@ -383,10 +397,16 @@ async fn binding_array_sampled_textures(ctx: TestingContext, partially_bound: bo
     let bind_group = ctx.device.create_bind_group(&BindGroupDescriptor {
         label: Some("Bind Group"),
         layout: &bind_group_layout,
-        entries: &[BindGroupEntry {
-            binding: 0,
-            resource: BindingResource::TextureViewArray(&input_view_references),
-        }],
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::TextureViewArray(&input_view_references),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::TextureViewArray(&[&input_views[0]]),
+            },
+        ],
     });
 
     let pipeline_layout = ctx
@@ -453,7 +473,11 @@ async fn binding_array_sampled_textures(ctx: TestingContext, partially_bound: bo
     let readback_buffers = ReadbackBuffers::new(&ctx.device, &output_texture);
     readback_buffers.copy_from(&ctx.device, &mut encoder, &output_texture);
 
-    ctx.queue.submit(Some(encoder.finish()));
+    let commands = encoder.finish();
+    drop(bind_group);
+    drop(input_view_references);
+    drop(input_views);
+    ctx.queue.submit(Some(commands));
 
     readback_buffers.assert_buffer_contents(&ctx, &image).await;
 }

@@ -1081,11 +1081,17 @@ enum BufferLikeResource {
     AccelerationStructure(NonNull<ProtocolObject<dyn MTLAccelerationStructure>>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct UseResourceInfo {
     uses: MTLResourceUsage,
     stages: MTLRenderStages,
     visible_in_compute: bool,
+}
+
+#[derive(Debug)]
+struct ResourceBatch {
+    info: UseResourceInfo,
+    resources: Vec<NonNull<ProtocolObject<dyn MTLResource>>>,
 }
 
 impl Default for UseResourceInfo {
@@ -1106,7 +1112,7 @@ pub struct BindGroup {
     textures: Vec<NonNull<ProtocolObject<dyn MTLTexture>>>,
 
     argument_buffers: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
-    resources_to_use: HashMap<NonNull<ProtocolObject<dyn MTLResource>>, UseResourceInfo>,
+    resources_to_use: Vec<ResourceBatch>,
 }
 
 impl crate::DynBindGroup for BindGroup {}
