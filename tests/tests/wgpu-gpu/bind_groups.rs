@@ -1,8 +1,16 @@
-use std::num::NonZeroU64;
+use std::{array::from_fn, num::NonZeroU64};
 
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
-    BufferUsages, PollType,
+    BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
+    BindingResource, BindingType, BufferBinding, BufferBindingType, BufferDescriptor, BufferUsages,
+    ColorTargetState, ColorWrites, ComputePassDescriptor, ComputePipelineDescriptor,
+    DownlevelFlags, Extent3d, FilterMode, FragmentState, Limits, MapMode,
+    PipelineCompilationOptions, PipelineLayoutDescriptor, PollType, RenderPassColorAttachment,
+    RenderPassDescriptor, RenderPipelineDescriptor, SamplerBindingType, SamplerDescriptor,
+    ShaderModuleDescriptor, ShaderSource, ShaderStages, TexelCopyBufferInfo, TexelCopyBufferLayout,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+    TextureViewDimension, VertexState,
 };
 use wgpu_test::{
     gpu_test, image::ReadbackBuffers, FailureCase, GpuTestConfiguration, GpuTestInitializer,
@@ -22,6 +30,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         BIND_GROUP_WITH_MAX_BINDING_INDEX,
         STORAGE_ARRAY_LENGTHS_ACROSS_STAGES_AND_PIPELINES,
         RENDER_BIND_GROUP_REBINDING,
+        RESOURCE_BINDINGS_ACROSS_STAGES_AND_PASSES,
     ]);
 }
 
@@ -829,3 +838,311 @@ async fn render_bind_group_rebinding(ctx: TestingContext) {
 static RENDER_BIND_GROUP_REBINDING: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(TestParameters::default().limits(wgpu::Limits::downlevel_defaults()))
     .run_async(render_bind_group_rebinding);
+
+#[gpu_test]
+static RESOURCE_BINDINGS_ACROSS_STAGES_AND_PASSES: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(
+            TestParameters::default()
+                .limits(Limits::downlevel_defaults())
+                .downlevel_flags(DownlevelFlags::VERTEX_STORAGE | DownlevelFlags::COMPUTE_SHADERS),
+        )
+        .run_async(resource_bindings_across_stages_and_passes);
+
+async fn resource_bindings_across_stages_and_passes(ctx: TestingContext) {
+    let device = &ctx.device;
+    let alignment = device.limits().min_storage_buffer_offset_alignment as usize;
+    let inputs = [[17u32, 41], [67, 89]].map(|values| {
+        let mut bytes = vec![0; alignment + 8];
+        bytes[..4].copy_from_slice(&values[0].to_le_bytes());
+        bytes[alignment..alignment + 4].copy_from_slice(&values[1].to_le_bytes());
+        device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("binding inputs"),
+            contents: &bytes,
+            usage: BufferUsages::STORAGE,
+        })
+    });
+    let textures = [
+        [32, 0, 0, 255, 224, 0, 0, 255],
+        [64, 0, 0, 255, 192, 0, 0, 255],
+    ]
+    .map(|pixels| {
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("binding texture"),
+            size: Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        ctx.queue.write_texture(
+            texture.as_image_copy(),
+            &pixels,
+            TexelCopyBufferLayout {
+                bytes_per_row: Some(8),
+                ..Default::default()
+            },
+            texture.size(),
+        );
+        texture.create_view(&Default::default())
+    });
+    let samplers = [FilterMode::Nearest, FilterMode::Linear].map(|filter| {
+        device.create_sampler(&SamplerDescriptor {
+            min_filter: filter,
+            mag_filter: filter,
+            ..Default::default()
+        })
+    });
+    let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX_FRAGMENT | ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: true,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::VERTEX_FRAGMENT | ShaderStages::COMPUTE,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::VERTEX_FRAGMENT | ShaderStages::COMPUTE,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let groups =
+        [(0, 0, 0, 4), (1, 0, 1, 8), (1, 1, 0, 4)].map(|(buffer, texture, sampler, size)| {
+            device.create_bind_group(&BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::Buffer(BufferBinding {
+                            buffer: &inputs[buffer],
+                            offset: 0,
+                            size: NonZeroU64::new(size),
+                        }),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::TextureView(&textures[texture]),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::Sampler(&samplers[sampler]),
+                    },
+                ],
+            })
+        });
+    let output = device.create_buffer(&BufferDescriptor {
+        label: None,
+        size: 16,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let output_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let output_group = device.create_bind_group(&BindGroupDescriptor {
+        label: None,
+        layout: &output_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: output.as_entire_binding(),
+        }],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&layout), Some(&output_layout)],
+        immediate_size: 0,
+    });
+    let shader = device.create_shader_module(ShaderModuleDescriptor {
+        label: None, source: ShaderSource::Wgsl(r#"
+            @group(0) @binding(0) var<storage, read> values: array<u32>;
+            @group(0) @binding(1) var image: texture_2d<f32>;
+            @group(0) @binding(2) var image_sampler: sampler;
+            @group(1) @binding(0) var<storage, read_write> output: array<u32>;
+            override record: u32 = 0u;
+            override bias: u32 = 0u;
+            fn sample_value() -> u32 {
+                return values[0] * arrayLength(&values) + u32(round(textureSampleLevel(image, image_sampler, vec2(0.5), 0.0).r * 255.0));
+            }
+            @compute @workgroup_size(1) fn compute() { output[record] = sample_value(); }
+            struct VertexOutput {
+                @builtin(position) position: vec4<f32>,
+                @location(0) @interpolate(flat) value: u32,
+            }
+            @vertex fn vertex(@builtin(vertex_index) index: u32) -> VertexOutput {
+                let positions = array(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+                return VertexOutput(vec4(positions[index], 0.0, 1.0), sample_value());
+            }
+            @fragment fn fragment(input: VertexOutput) -> @location(0) u32 {
+                return input.value + sample_value() + bias;
+            }
+        "#.into()),
+    });
+    let compute_pipelines: [_; 4] = from_fn(|record| {
+        device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("compute"),
+            compilation_options: PipelineCompilationOptions {
+                constants: &[("record", record as f64)],
+                ..Default::default()
+            },
+            cache: None,
+        })
+    });
+    let render_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let render_pipelines = [0.0, 1.0].map(|bias| {
+        device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&render_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vertex"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fragment"),
+                compilation_options: PipelineCompilationOptions {
+                    constants: &[("bias", bias)],
+                    ..Default::default()
+                },
+                targets: &[Some(ColorTargetState {
+                    format: TextureFormat::R32Uint,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    });
+    let target = device.create_texture(&TextureDescriptor {
+        label: None,
+        size: Extent3d {
+            width: 4,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Uint,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&Default::default());
+    let readback = device.create_buffer(&BufferDescriptor {
+        label: None,
+        size: 512,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let unused_vertices = [4, 8].map(|size| {
+        device.create_buffer(&BufferDescriptor {
+            label: None,
+            size,
+            usage: BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        })
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let bindings = [(0, 0), (0, alignment as u32), (1, 0), (2, 0)];
+    for _ in 0..2 {
+        {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+            pass.set_bind_group(1, &output_group, &[]);
+            for (index, &(group, offset)) in bindings.iter().enumerate() {
+                pass.set_pipeline(&compute_pipelines[index]);
+                pass.set_bind_group(0, &groups[group], &[offset]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+        }
+        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: Default::default(),
+            })],
+            ..Default::default()
+        });
+        for (index, &(group, offset)) in bindings.iter().enumerate() {
+            pass.set_pipeline(&render_pipelines[index % 2]);
+            pass.set_bind_group(0, &groups[group], &[offset]);
+            pass.set_vertex_buffer(0, unused_vertices[index % 2].slice(..));
+            pass.set_viewport(index as f32, 0.0, 1.0, 1.0, 0.0, 1.0);
+            pass.draw(0..3, 0..1);
+        }
+    }
+    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, 16);
+    encoder.copy_texture_to_buffer(
+        target.as_image_copy(),
+        TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: TexelCopyBufferLayout {
+                offset: 256,
+                bytes_per_row: Some(256),
+                rows_per_image: None,
+            },
+        },
+        target.size(),
+    );
+    ctx.queue.submit([encoder.finish()]);
+    readback.slice(..).map_async(MapMode::Read, |result| {
+        result.expect("resource binding results map after submission");
+    });
+    ctx.async_poll(PollType::wait_indefinitely())
+        .await
+        .expect("resource binding submission completes");
+    let data = readback
+        .slice(..)
+        .get_mapped_range()
+        .expect("resource binding readback is mapped");
+    let words: &[u32] = bytemuck::cast_slice(&data);
+    assert_eq!(words[..4], [241, 265, 262, 259]);
+    assert_eq!(words[64..68], [482, 531, 524, 519]);
+}
