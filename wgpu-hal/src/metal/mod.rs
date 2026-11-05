@@ -43,7 +43,7 @@ use objc2::{
     rc::{autoreleasepool, Retained},
     runtime::ProtocolObject,
 };
-use objc2_foundation::ns_string;
+use objc2_foundation::{ns_string, NSUInteger};
 use objc2_metal::{
     MTLAccelerationStructure, MTLAccelerationStructureCommandEncoder, MTLArgumentBuffersTier,
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue,
@@ -979,6 +979,22 @@ impl<T> ops::Index<naga::ShaderStage> for MultiStageData<T> {
     }
 }
 
+impl<T> ops::IndexMut<naga::ShaderStage> for MultiStageData<T> {
+    fn index_mut(&mut self, stage: naga::ShaderStage) -> &mut Self::Output {
+        match stage {
+            naga::ShaderStage::Vertex => &mut self.vs,
+            naga::ShaderStage::Fragment => &mut self.fs,
+            naga::ShaderStage::Compute => &mut self.cs,
+            naga::ShaderStage::Task => &mut self.ts,
+            naga::ShaderStage::Mesh => &mut self.ms,
+            naga::ShaderStage::RayGeneration
+            | naga::ShaderStage::AnyHit
+            | naga::ShaderStage::ClosestHit
+            | naga::ShaderStage::Miss => unimplemented!(),
+        }
+    }
+}
+
 impl<T> MultiStageData<T> {
     fn map_ref<Y>(&self, fun: impl Fn(&T) -> Y) -> MultiStageData<Y> {
         MultiStageData {
@@ -1319,6 +1335,20 @@ struct Temp {
     binding_sizes: Vec<u32>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NativeBufferBinding {
+    buffer: NonNull<ProtocolObject<dyn MTLBuffer>>,
+    offset: NSUInteger,
+}
+
+/// Native argument slots in one encoder; resource ownership remains with the caller.
+#[derive(Default)]
+struct NativeBindings {
+    buffers: Vec<Option<NativeBufferBinding>>,
+    samplers: Vec<Option<NonNull<ProtocolObject<dyn MTLSamplerState>>>>,
+    textures: Vec<Option<NonNull<ProtocolObject<dyn MTLTexture>>>>,
+}
+
 // Any state in this struct that may be dirty after an abandoned encoding must
 // be reset in `discard_encoding` for possible encoder reuse.
 struct CommandState {
@@ -1330,6 +1360,7 @@ struct CommandState {
     raw_primitive_type: MTLPrimitiveType,
     index: Option<IndexState>,
     stage_infos: MultiStageData<PipelineStageInfo>,
+    native_bindings: MultiStageData<NativeBindings>,
 
     /// Sizes of currently bound [`wgt::BufferBindingType::Storage`] buffers.
     ///

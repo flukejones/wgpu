@@ -23,7 +23,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{ops::Range, ptr::NonNull};
+use core::{ffi::c_void, ops::Range, ptr::NonNull};
 use smallvec::SmallVec;
 use wgpu_sync::atomic;
 
@@ -40,6 +40,7 @@ impl Default for super::CommandState {
             raw_primitive_type: MTLPrimitiveType::Point,
             index: None,
             stage_infos: Default::default(),
+            native_bindings: Default::default(),
             storage_buffer_length_map: Default::default(),
             vertex_buffer_size_map: Default::default(),
             immediates: Vec::new(),
@@ -73,26 +74,46 @@ impl Encoder<'_> {
 
     fn set_buffer(
         &self,
-        buffer: Option<&ProtocolObject<dyn MTLBuffer>>,
+        bindings: &mut super::NativeBindings,
+        buffer: &ProtocolObject<dyn MTLBuffer>,
         offset: NSUInteger,
         index: NSUInteger,
     ) {
+        let value = super::NativeBufferBinding {
+            buffer: NonNull::from(buffer),
+            offset,
+        };
+        if bindings.buffers.get(index).copied().flatten() == Some(value) {
+            return;
+        }
         unsafe {
             match *self {
-                Self::Vertex(enc) => enc.setVertexBuffer_offset_atIndex(buffer, offset, index),
-                Self::Fragment(enc) => enc.setFragmentBuffer_offset_atIndex(buffer, offset, index),
-                Self::Task(enc) => enc.setObjectBuffer_offset_atIndex(buffer, offset, index),
-                Self::Mesh(enc) => enc.setMeshBuffer_offset_atIndex(buffer, offset, index),
-                Self::Compute(enc) => enc.setBuffer_offset_atIndex(buffer, offset, index),
+                Self::Vertex(enc) => {
+                    enc.setVertexBuffer_offset_atIndex(Some(buffer), offset, index)
+                }
+                Self::Fragment(enc) => {
+                    enc.setFragmentBuffer_offset_atIndex(Some(buffer), offset, index)
+                }
+                Self::Task(enc) => enc.setObjectBuffer_offset_atIndex(Some(buffer), offset, index),
+                Self::Mesh(enc) => enc.setMeshBuffer_offset_atIndex(Some(buffer), offset, index),
+                Self::Compute(enc) => enc.setBuffer_offset_atIndex(Some(buffer), offset, index),
             }
         }
+        if bindings.buffers.len() <= index {
+            bindings.buffers.resize(index + 1, None);
+        }
+        bindings.buffers[index] = Some(value);
     }
 
     fn set_acceleration_structure(
         &self,
+        bindings: &mut super::NativeBindings,
         buffer: Option<&ProtocolObject<dyn MTLAccelerationStructure>>,
         index: NSUInteger,
     ) {
+        if let Some(binding) = bindings.buffers.get_mut(index) {
+            *binding = None;
+        }
         unsafe {
             match *self {
                 Self::Vertex(enc) => {
@@ -112,7 +133,16 @@ impl Encoder<'_> {
         }
     }
 
-    fn set_bytes(&self, bytes: NonNull<core::ffi::c_void>, length: NSUInteger, index: NSUInteger) {
+    fn set_bytes(
+        &self,
+        bindings: &mut super::NativeBindings,
+        bytes: NonNull<c_void>,
+        length: NSUInteger,
+        index: NSUInteger,
+    ) {
+        if let Some(binding) = bindings.buffers.get_mut(index) {
+            *binding = None;
+        }
         unsafe {
             match *self {
                 Self::Vertex(enc) => enc.setVertexBytes_length_atIndex(bytes, length, index),
@@ -126,30 +156,60 @@ impl Encoder<'_> {
 
     fn set_sampler_state(
         &self,
-        state: Option<&ProtocolObject<dyn MTLSamplerState>>,
+        bindings: &mut super::NativeBindings,
+        state: &ProtocolObject<dyn MTLSamplerState>,
         index: NSUInteger,
     ) {
+        let value = NonNull::from(state);
+        if bindings.samplers.get(index).copied().flatten() == Some(value) {
+            return;
+        }
         unsafe {
             match *self {
-                Self::Vertex(enc) => enc.setVertexSamplerState_atIndex(state, index),
-                Self::Fragment(enc) => enc.setFragmentSamplerState_atIndex(state, index),
-                Self::Task(enc) => enc.setObjectSamplerState_atIndex(state, index),
-                Self::Mesh(enc) => enc.setMeshSamplerState_atIndex(state, index),
-                Self::Compute(enc) => enc.setSamplerState_atIndex(state, index),
+                Self::Vertex(enc) => enc.setVertexSamplerState_atIndex(Some(state), index),
+                Self::Fragment(enc) => enc.setFragmentSamplerState_atIndex(Some(state), index),
+                Self::Task(enc) => enc.setObjectSamplerState_atIndex(Some(state), index),
+                Self::Mesh(enc) => enc.setMeshSamplerState_atIndex(Some(state), index),
+                Self::Compute(enc) => enc.setSamplerState_atIndex(Some(state), index),
             }
         }
+        if bindings.samplers.len() <= index {
+            bindings.samplers.resize(index + 1, None);
+        }
+        bindings.samplers[index] = Some(value);
     }
 
-    fn set_texture(&self, texture: Option<&ProtocolObject<dyn MTLTexture>>, index: NSUInteger) {
+    fn set_texture(
+        &self,
+        bindings: &mut super::NativeBindings,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        index: NSUInteger,
+    ) {
+        let value = NonNull::from(texture);
+        if bindings.textures.get(index).copied().flatten() == Some(value) {
+            return;
+        }
         unsafe {
             match *self {
-                Self::Vertex(enc) => enc.setVertexTexture_atIndex(texture, index),
-                Self::Fragment(enc) => enc.setFragmentTexture_atIndex(texture, index),
-                Self::Task(enc) => enc.setObjectTexture_atIndex(texture, index),
-                Self::Mesh(enc) => enc.setMeshTexture_atIndex(texture, index),
-                Self::Compute(enc) => enc.setTexture_atIndex(texture, index),
+                Self::Vertex(enc) => enc.setVertexTexture_atIndex(Some(texture), index),
+                Self::Fragment(enc) => enc.setFragmentTexture_atIndex(Some(texture), index),
+                Self::Task(enc) => enc.setObjectTexture_atIndex(Some(texture), index),
+                Self::Mesh(enc) => enc.setMeshTexture_atIndex(Some(texture), index),
+                Self::Compute(enc) => enc.setTexture_atIndex(Some(texture), index),
             }
         }
+        if bindings.textures.len() <= index {
+            bindings.textures.resize(index + 1, None);
+        }
+        bindings.textures[index] = Some(value);
+    }
+}
+
+impl super::NativeBindings {
+    fn clear(&mut self) {
+        self.buffers.clear();
+        self.samplers.clear();
+        self.textures.clear();
     }
 }
 
@@ -345,12 +405,17 @@ impl super::CommandEncoder {
                     binding_size,
                     binding_location,
                 } => {
-                    let buffer = Some(unsafe { ptr.as_ref() });
+                    let buffer = unsafe { ptr.as_ref() };
                     if let Some(dyn_index) = dynamic_index {
                         offset += dynamic_offsets[*dyn_index as usize] as wgt::BufferAddress;
                     }
                     let index = (resource_indices.buffers + index) as usize;
-                    encoder.set_buffer(buffer, offset as usize, index);
+                    encoder.set_buffer(
+                        &mut self.state.native_bindings[encoder.stage()],
+                        buffer,
+                        offset as usize,
+                        index,
+                    );
                     let br = naga::ResourceBinding {
                         group: group_index,
                         binding: *binding_location,
@@ -365,9 +430,14 @@ impl super::CommandEncoder {
                     array_element_sizes,
                     binding_location,
                 } => {
-                    let buffer = Some(unsafe { ptr.as_ref() });
+                    let buffer = unsafe { ptr.as_ref() };
                     let index = (resource_indices.buffers + index) as usize;
-                    encoder.set_buffer(buffer, 0, index);
+                    encoder.set_buffer(
+                        &mut self.state.native_bindings[encoder.stage()],
+                        buffer,
+                        0,
+                        index,
+                    );
                     let br = naga::ResourceBinding {
                         group: group_index,
                         binding: *binding_location,
@@ -382,7 +452,11 @@ impl super::CommandEncoder {
                 super::BufferLikeResource::AccelerationStructure(ptr) => {
                     let buffer = Some(unsafe { ptr.as_ref() });
                     let index = (resource_indices.buffers + index) as usize;
-                    encoder.set_acceleration_structure(buffer, index);
+                    encoder.set_acceleration_structure(
+                        &mut self.state.native_bindings[encoder.stage()],
+                        buffer,
+                        index,
+                    );
                 }
             }
         }
@@ -394,7 +468,12 @@ impl super::CommandEncoder {
                 let bytes_ptr = NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap();
                 let length = sizes.len() * WORD_SIZE;
                 let index = index as _;
-                encoder.set_bytes(bytes_ptr, length, index);
+                encoder.set_bytes(
+                    &mut self.state.native_bindings[encoder.stage()],
+                    bytes_ptr,
+                    length,
+                    index,
+                );
             }
         }
         let samplers = match encoder.stage() {
@@ -408,8 +487,12 @@ impl super::CommandEncoder {
         for index in 0..samplers {
             let res = group.samplers[(index_base.samplers + index) as usize];
             let index = (resource_indices.samplers + index) as usize;
-            let state = Some(unsafe { res.as_ref() });
-            encoder.set_sampler_state(state, index);
+            let state = unsafe { res.as_ref() };
+            encoder.set_sampler_state(
+                &mut self.state.native_bindings[encoder.stage()],
+                state,
+                index,
+            );
         }
 
         let textures = match encoder.stage() {
@@ -423,14 +506,21 @@ impl super::CommandEncoder {
         for index in 0..textures {
             let res = group.textures[(index_base.textures + index) as usize];
             let index = (resource_indices.textures + index) as usize;
-            let texture = Some(unsafe { res.as_ref() });
-            encoder.set_texture(texture, index);
+            let texture = unsafe { res.as_ref() };
+            encoder.set_texture(
+                &mut self.state.native_bindings[encoder.stage()],
+                texture,
+                index,
+            );
         }
     }
 }
 
 impl super::CommandState {
     fn reset(&mut self) {
+        for bindings in self.native_bindings.iter_mut() {
+            bindings.clear();
+        }
         self.storage_buffer_length_map.clear();
         self.vertex_buffer_size_map.clear();
         self.stage_infos.vs.clear();
@@ -542,6 +632,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
         }
         if let Some(encoder) = self.state.compute.take() {
             encoder.endEncoding();
+        }
+        for bindings in self.state.native_bindings.iter_mut() {
+            bindings.clear();
         }
         self.state.pending_timer_queries.clear();
         let had_command_buffer = self.raw_cmd_buf.is_some();
@@ -1215,53 +1308,48 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
         let bytes = NonNull::new(state_pc.as_ptr().cast_mut().cast()).unwrap();
         if let Some(ref compute) = self.state.compute {
-            unsafe {
-                compute.setBytes_length_atIndex(
-                    bytes,
-                    layout.total_immediates as usize * WORD_SIZE,
-                    layout.immediates_infos.cs.unwrap().buffer_index as usize,
-                )
-            };
+            Encoder::Compute(compute).set_bytes(
+                &mut self.state.native_bindings.cs,
+                bytes,
+                layout.total_immediates as usize * WORD_SIZE,
+                layout.immediates_infos.cs.unwrap().buffer_index as usize,
+            );
         }
         if let Some(ref render) = self.state.render {
             if let Some(vs) = layout.immediates_infos.vs {
-                unsafe {
-                    render.setVertexBytes_length_atIndex(
-                        bytes,
-                        layout.total_immediates as usize * WORD_SIZE,
-                        vs.buffer_index as _,
-                    )
-                }
+                Encoder::Vertex(render).set_bytes(
+                    &mut self.state.native_bindings.vs,
+                    bytes,
+                    layout.total_immediates as usize * WORD_SIZE,
+                    vs.buffer_index as _,
+                );
             }
             if let Some(fs) = layout.immediates_infos.fs {
-                unsafe {
-                    render.setFragmentBytes_length_atIndex(
-                        bytes,
-                        layout.total_immediates as usize * WORD_SIZE,
-                        fs.buffer_index as _,
-                    )
-                }
+                Encoder::Fragment(render).set_bytes(
+                    &mut self.state.native_bindings.fs,
+                    bytes,
+                    layout.total_immediates as usize * WORD_SIZE,
+                    fs.buffer_index as _,
+                );
             }
             if let Some(ts) = layout.immediates_infos.ts {
                 if self.shared.private_caps.mesh_shaders {
-                    unsafe {
-                        render.setObjectBytes_length_atIndex(
-                            bytes,
-                            layout.total_immediates as usize * WORD_SIZE,
-                            ts.buffer_index as _,
-                        )
-                    }
+                    Encoder::Task(render).set_bytes(
+                        &mut self.state.native_bindings.ts,
+                        bytes,
+                        layout.total_immediates as usize * WORD_SIZE,
+                        ts.buffer_index as _,
+                    );
                 }
             }
             if let Some(ms) = layout.immediates_infos.ms {
                 if self.shared.private_caps.mesh_shaders {
-                    unsafe {
-                        render.setMeshBytes_length_atIndex(
-                            bytes,
-                            layout.total_immediates as usize * WORD_SIZE,
-                            ms.buffer_index as _,
-                        )
-                    }
+                    Encoder::Mesh(render).set_bytes(
+                        &mut self.state.native_bindings.ms,
+                        bytes,
+                        layout.total_immediates as usize * WORD_SIZE,
+                        ms.buffer_index as _,
+                    );
                 }
             }
         }
@@ -1328,13 +1416,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 .state
                 .make_sizes_buffer_update(naga::ShaderStage::Vertex, &mut self.temp.binding_sizes)
             {
-                unsafe {
-                    encoder.setVertexBytes_length_atIndex(
-                        NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
-                        sizes.len() * WORD_SIZE,
-                        index as _,
-                    )
-                };
+                Encoder::Vertex(encoder).set_bytes(
+                    &mut self.state.native_bindings.vs,
+                    NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
+                    sizes.len() * WORD_SIZE,
+                    index as _,
+                );
             }
         }
         if pipeline.fs_info.is_some() {
@@ -1342,13 +1429,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 .state
                 .make_sizes_buffer_update(naga::ShaderStage::Fragment, &mut self.temp.binding_sizes)
             {
-                unsafe {
-                    encoder.setFragmentBytes_length_atIndex(
-                        NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
-                        sizes.len() * WORD_SIZE,
-                        index as _,
-                    )
-                };
+                Encoder::Fragment(encoder).set_bytes(
+                    &mut self.state.native_bindings.fs,
+                    NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
+                    sizes.len() * WORD_SIZE,
+                    index as _,
+                );
             }
         }
         if let Some(ts_info) = &pipeline.ts_info {
@@ -1377,13 +1463,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 .state
                 .make_sizes_buffer_update(naga::ShaderStage::Task, &mut self.temp.binding_sizes)
             {
-                unsafe {
-                    encoder.setObjectBytes_length_atIndex(
-                        NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
-                        sizes.len() * WORD_SIZE,
-                        index as _,
-                    )
-                };
+                Encoder::Task(encoder).set_bytes(
+                    &mut self.state.native_bindings.ts,
+                    NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
+                    sizes.len() * WORD_SIZE,
+                    index as _,
+                );
             }
         }
         if let Some(_ms_info) = &pipeline.ms_info {
@@ -1396,13 +1481,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 .state
                 .make_sizes_buffer_update(naga::ShaderStage::Mesh, &mut self.temp.binding_sizes)
             {
-                unsafe {
-                    encoder.setMeshBytes_length_atIndex(
-                        NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
-                        sizes.len() * WORD_SIZE,
-                        index as _,
-                    )
-                };
+                Encoder::Mesh(encoder).set_bytes(
+                    &mut self.state.native_bindings.ms,
+                    NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
+                    sizes.len() * WORD_SIZE,
+                    index as _,
+                );
             }
         }
     }
@@ -1428,13 +1512,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
     ) {
         let buffer_index = MAX_BUFFERS - 1 - index;
         let encoder = self.state.render.as_ref().unwrap();
-        unsafe {
-            encoder.setVertexBuffer_offset_atIndex(
-                Some(&binding.buffer.raw),
-                binding.offset as usize,
-                buffer_index as usize,
-            )
-        };
+        Encoder::Vertex(encoder).set_buffer(
+            &mut self.state.native_bindings.vs,
+            &binding.buffer.raw,
+            binding.offset as usize,
+            buffer_index as usize,
+        );
 
         self.state
             .vertex_buffer_size_map
@@ -1444,13 +1527,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
             .state
             .make_sizes_buffer_update(naga::ShaderStage::Vertex, &mut self.temp.binding_sizes)
         {
-            unsafe {
-                encoder.setVertexBytes_length_atIndex(
-                    NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
-                    sizes.len() * WORD_SIZE,
-                    index as _,
-                )
-            };
+            Encoder::Vertex(encoder).set_bytes(
+                &mut self.state.native_bindings.vs,
+                NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
+                sizes.len() * WORD_SIZE,
+                index as _,
+            );
         }
     }
 
@@ -1780,13 +1862,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
             .state
             .make_sizes_buffer_update(naga::ShaderStage::Compute, &mut self.temp.binding_sizes)
         {
-            unsafe {
-                encoder.setBytes_length_atIndex(
-                    NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
-                    sizes.len() * WORD_SIZE,
-                    index as _,
-                )
-            };
+            Encoder::Compute(encoder).set_bytes(
+                &mut self.state.native_bindings.cs,
+                NonNull::new(sizes.as_ptr().cast_mut().cast()).unwrap(),
+                sizes.len() * WORD_SIZE,
+                index as _,
+            );
         }
 
         // update the threadgroup memory sizes
