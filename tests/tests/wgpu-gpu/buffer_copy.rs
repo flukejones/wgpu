@@ -8,7 +8,35 @@ use wgpu_test::{
 
 pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
     vec.push(COPY_ALIGNMENT);
+    vec.push(QUEUE_WRITE_BUFFER_VIEW);
 }
+
+#[apply(gpu_test!)]
+static QUEUE_WRITE_BUFFER_VIEW: GpuTestConfiguration =
+    GpuTestConfiguration::new().run_async(|ctx| async move {
+        let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("queue write view destination"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        ctx.queue
+            .write_buffer_with(&buffer, 0, 16.try_into().expect("nonempty upload"))
+            .expect("valid upload view")
+            .copy_from_slice(&[0x5a; 16]);
+        ctx.queue.submit([]);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |result| {
+            result.expect("uploaded buffer mapping");
+        });
+        ctx.async_poll(wgpu::PollType::wait_indefinitely())
+            .await
+            .expect("upload completion");
+        assert_eq!(
+            &*buffer.slice(..).get_mapped_range().expect("uploaded bytes"),
+            &[0x5a; 16]
+        );
+        buffer.unmap();
+    });
 
 fn try_copy(
     ctx: &wgpu_test::TestingContext,

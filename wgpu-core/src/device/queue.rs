@@ -966,11 +966,7 @@ impl Queue {
             buffer_offset,
         );
 
-        drop(snatch_guard);
-
         pending_writes.consume(staging_buffer);
-
-        drop(pending_writes);
 
         result
     }
