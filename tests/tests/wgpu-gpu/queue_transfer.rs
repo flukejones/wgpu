@@ -8,8 +8,100 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         QUEUE_WRITE_TEXTURE_THEN_DESTROY,
         QUEUE_WRITE_TEXTURE_OVERFLOW,
         QUEUE_WRITE_TEXTURE_BUFFER_OOB,
+        QUEUE_WRITE_BUFFER_RECYCLING,
     ]);
 }
+
+#[gpu_test]
+static QUEUE_WRITE_BUFFER_RECYCLING: GpuTestConfiguration =
+    GpuTestConfiguration::new().run_async(|ctx| async move {
+        let destination = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("queue write destination"),
+            size: 300 * 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("queue write snapshots"),
+            size: destination.size() * 3,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut retained_buffers = None;
+        for cycle in 0..2_u32 {
+            for submission in 0..3_u32 {
+                for slot in 0..300_u32 {
+                    let data = [cycle, submission, slot, 0xdead_beef];
+                    if slot % 2 == 0 {
+                        ctx.queue.write_buffer(
+                            &destination,
+                            u64::from(slot) * 16,
+                            bytemuck::cast_slice(&data),
+                        );
+                    } else {
+                        ctx.queue
+                            .write_buffer_with(
+                                &destination,
+                                u64::from(slot) * 16,
+                                16.try_into().expect("nonempty upload"),
+                            )
+                            .expect("valid queue write")
+                            .copy_from_slice(bytemuck::cast_slice(&data));
+                    }
+                    if cycle == 1 && submission == 0 && slot == 0 {
+                        let buffers = ctx.device.get_internal_counters().hal.buffers.read();
+                        if buffers != 0 {
+                            assert_eq!(
+                                Some(buffers),
+                                retained_buffers,
+                                "the warmed upload must reuse a completed native allocation"
+                            );
+                        }
+                    }
+                }
+                let mut encoder = ctx.device.create_command_encoder(&Default::default());
+                encoder.copy_buffer_to_buffer(
+                    &destination,
+                    0,
+                    &readback,
+                    u64::from(submission) * destination.size(),
+                    destination.size(),
+                );
+                ctx.queue.submit([encoder.finish()]);
+            }
+            readback.slice(..).map_async(wgpu::MapMode::Read, |result| {
+                result.expect("queue write readback mapping");
+            });
+            ctx.async_poll(PollType::wait_indefinitely())
+                .await
+                .expect("queue write completion");
+            {
+                let mapped = readback
+                    .slice(..)
+                    .get_mapped_range()
+                    .expect("mapped snapshots");
+                let words: &[u32] = bytemuck::cast_slice(&mapped);
+                for submission in 0..3_u32 {
+                    for slot in 0..300_u32 {
+                        let offset = (submission * 300 + slot) as usize * 4;
+                        assert_eq!(
+                            &words[offset..offset + 4],
+                            &[cycle, submission, slot, 0xdead_beef],
+                            "queue writes must preserve each submitted snapshot"
+                        );
+                    }
+                }
+            }
+            readback.unmap();
+            retained_buffers = Some(ctx.device.get_internal_counters().hal.buffers.read());
+        }
+        ctx.queue.write_buffer(&destination, 0, &[9; 16]);
+        destination.destroy();
+        ctx.queue.submit([]);
+        ctx.async_poll(PollType::wait_indefinitely())
+            .await
+            .expect("destroyed destination upload completion");
+    });
 
 #[gpu_test]
 static QUEUE_WRITE_TEXTURE_THEN_DESTROY: GpuTestConfiguration = GpuTestConfiguration::new()

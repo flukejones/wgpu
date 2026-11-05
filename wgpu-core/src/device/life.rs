@@ -1,4 +1,5 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use core::mem::take;
 
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -9,10 +10,14 @@ use crate::{
         DeviceError,
     },
     ray_tracing::BlasCompactReadyPendingClosure,
-    resource::{Blas, Buffer, QuerySet, Texture, Trackable},
+    resource::{Blas, Buffer, FlushedStagingBuffer, QuerySet, Texture, Trackable},
     snatch::SnatchGuard,
     SubmissionIndex,
 };
+
+const MAX_STAGING_BUFFERS: usize = 256;
+const MAX_STAGING_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CACHED_STAGING_BUFFER_SIZE: u64 = 1024 * 1024;
 
 /// A command submitted to the GPU for execution.
 ///
@@ -180,6 +185,9 @@ impl WaitIdleError {
 /// Only calling `Global::buffer_map_async` clones a new `Arc` for the
 /// buffer. This new `Arc` is only dropped by `handle_mapping`.
 pub(crate) struct LifetimeTracker {
+    // Retain only completed allocations, with bounded count and total bytes.
+    staging_buffers: VecDeque<FlushedStagingBuffer>,
+    staging_buffer_bytes: u64,
     /// Resources used by queue submissions still in flight. One entry per
     /// submission, with older submissions appearing before younger.
     ///
@@ -207,6 +215,8 @@ impl LifetimeTracker {
     pub fn new() -> Self {
         Self {
             active: Vec::new(),
+            staging_buffers: VecDeque::new(),
+            staging_buffer_bytes: 0,
             ready_to_map: Vec::new(),
             ready_to_compact: Vec::new(),
             work_done_closures: SmallVec::new(),
@@ -216,6 +226,19 @@ impl LifetimeTracker {
     /// Return true if there are no queue submissions still in flight.
     pub fn queue_empty(&self) -> bool {
         self.active.is_empty()
+    }
+
+    pub(crate) fn take_staging_buffer(
+        &mut self,
+        size: wgt::BufferSize,
+    ) -> Option<FlushedStagingBuffer> {
+        let index = self
+            .staging_buffers
+            .iter()
+            .rposition(|buffer| buffer.size == size)?;
+        let buffer = self.staging_buffers.swap_remove_back(index)?;
+        self.staging_buffer_bytes -= size.get();
+        Some(buffer)
     }
 
     /// Start tracking resources associated with a new queue submission.
@@ -338,11 +361,31 @@ impl LifetimeTracker {
         for a in self.active.drain(..done_count) {
             self.ready_to_map.extend(a.mapped);
             self.ready_to_compact.extend(a.compact_read_back);
-            for encoder in a.encoders {
+            for mut encoder in a.encoders {
+                let temp_resources = take(&mut encoder.temp_resources);
                 // This involves actually decrementing the ref count of all command buffer
                 // resources, so can be _very_ expensive.
                 profiling::scope!("drop command buffer trackers");
                 drop(encoder);
+                for resource in temp_resources {
+                    if let TempResource::StagingBuffer(buffer) = resource {
+                        if buffer.size.get() > MAX_CACHED_STAGING_BUFFER_SIZE {
+                            continue;
+                        }
+                        while self.staging_buffers.len() >= MAX_STAGING_BUFFERS
+                            || buffer.size.get()
+                                > MAX_STAGING_BUFFER_BYTES - self.staging_buffer_bytes
+                        {
+                            let evicted = self
+                                .staging_buffers
+                                .pop_front()
+                                .expect("nonempty staging cache at capacity");
+                            self.staging_buffer_bytes -= evicted.size.get();
+                        }
+                        self.staging_buffer_bytes += buffer.size.get();
+                        self.staging_buffers.push_back(buffer);
+                    }
+                }
             }
             work_done_closures.extend(a.work_done_closures);
         }
