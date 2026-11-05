@@ -696,6 +696,7 @@ pub(super) fn encode_compute_pass(
                 deferred_query_set_resolves: parent_state.deferred_query_set_resolves,
             },
             binder: Binder::new(),
+            render_bind_groups: None,
             temp_offsets: Vec::new(),
             dynamic_offset_count: 0,
             pending_discard_init_fixups: SurfacesInDiscardState::new(),
@@ -800,7 +801,6 @@ pub(super) fn encode_compute_pass(
                     index,
                     num_dynamic_offsets,
                     bind_group,
-                    false,
                 )
                 .map_pass_err(scope)?;
             }

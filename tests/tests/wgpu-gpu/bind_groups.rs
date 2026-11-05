@@ -21,6 +21,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         BIND_GROUP_NONFILTERING_LAYOUT_MIPMAP_SAMPLER,
         BIND_GROUP_WITH_MAX_BINDING_INDEX,
         STORAGE_ARRAY_LENGTHS_ACROSS_STAGES_AND_PIPELINES,
+        RENDER_BIND_GROUP_REBINDING,
     ]);
 }
 
@@ -601,3 +602,230 @@ async fn storage_array_lengths_across_stages_and_pipelines(ctx: TestingContext) 
         .assert_buffer_contents(&ctx, bytemuck::cast_slice(&expected))
         .await;
 }
+const RENDER_REBIND_SHADER: &str = "
+    @group(0) @binding(0) var<uniform> color: vec4f;
+    @group(0) @binding(1) var image: texture_2d<f32>;
+
+    @vertex
+    fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+        let positions = array(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+        return vec4f(positions[index], 0.0, 1.0);
+    }
+
+    @fragment
+    fn fs_main() -> @location(0) vec4f {
+        return color + textureLoad(image, vec2i(0), 0);
+    }
+";
+
+fn render_rebind_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    let group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: NonZeroU64::new(16),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&group_layout)],
+        immediate_size: 0,
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(RENDER_REBIND_SHADER.into()),
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+        }),
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    (pipeline, group_layout)
+}
+
+async fn render_bind_group_rebinding(ctx: TestingContext) {
+    let (pipeline, layout) = render_rebind_pipeline(&ctx.device);
+    let input = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("partially initialized dynamic uniform"),
+        size: 528,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    ctx.queue
+        .write_buffer(&input, 0, bytemuck::cast_slice(&[1.0_f32, 0.0, 0.0, 1.0]));
+    ctx.queue
+        .write_buffer(&input, 256, bytemuck::cast_slice(&[0.0_f32, 0.0, 1.0, 1.0]));
+    let textures = ["uninitialized then discarded", "initialized green"].map(|label| {
+        ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 2,
+            },
+            mip_level_count: 2,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        })
+    });
+    ctx.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &textures[1],
+            mip_level: 1,
+            origin: wgpu::Origin3d { x: 0, y: 0, z: 1 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &[0, 255, 0, 0],
+        wgpu::TexelCopyBufferLayout::default(),
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let views = textures.each_ref().map(|texture| {
+        texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_mip_level: 1,
+            mip_level_count: Some(1),
+            base_array_layer: 1,
+            array_layer_count: Some(1),
+            ..Default::default()
+        })
+    });
+    let groups = views.each_ref().map(|view| {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &input,
+                        offset: 0,
+                        size: NonZeroU64::new(16),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+            ],
+        })
+    });
+    let target = ctx.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("rebound colors before and after discard"),
+        size: wgpu::Extent3d {
+            width: 4,
+            height: 2,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&Default::default());
+    let readback = ReadbackBuffers::new(&ctx.device, &target);
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    for row in 0..2 {
+        if row == 1 {
+            let _discard = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &views[0],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::RED),
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                ..Default::default()
+            });
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&pipeline);
+        for (column, (group, offset)) in [
+            (&groups[0], 0),
+            (&groups[1], 0),
+            (&groups[0], 256),
+            (&groups[0], 512),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            pass.set_scissor_rect(column as u32, row, 1, 1);
+            pass.set_bind_group(0, group, &[offset]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+    readback.copy_from(&ctx.device, &mut encoder, &target);
+    drop((groups, views, textures, input, pipeline));
+    ctx.queue.submit([encoder.finish()]);
+    readback
+        .assert_buffer_contents(
+            &ctx,
+            &[
+                255, 0, 0, 255, 255, 255, 0, 255, 0, 0, 255, 255, 0, 0, 0, 0, 255, 0, 0, 255, 255,
+                255, 0, 255, 0, 0, 255, 255, 0, 0, 0, 0,
+            ],
+        )
+        .await;
+}
+
+#[gpu_test]
+static RENDER_BIND_GROUP_REBINDING: GpuTestConfiguration = GpuTestConfiguration::new()
+    .parameters(TestParameters::default().limits(wgpu::Limits::downlevel_defaults()))
+    .run_async(render_bind_group_rebinding);

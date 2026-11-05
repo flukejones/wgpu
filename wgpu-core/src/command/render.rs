@@ -2379,6 +2379,7 @@ pub(super) fn encode_render_pass(
                 pending_discard_init_fixups,
                 scope: device.new_usage_scope(),
                 binder: Binder::new(),
+                render_bind_groups: Some(Default::default()),
 
                 temp_offsets: Vec::new(),
                 dynamic_offset_count: 0,
@@ -2407,7 +2408,6 @@ pub(super) fn encode_render_pass(
                         index,
                         num_dynamic_offsets,
                         bind_group,
-                        true,
                     )
                     .map_pass_err(scope)?;
                 }
