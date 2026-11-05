@@ -172,10 +172,10 @@ impl Queue {
     ///   there will likely be no difference, since the compiler will be able to
     ///   optimize out unnecessary copies regardless.
     ///
-    /// * Currently on native platforms, for both of these methods, the staging
-    ///   memory will be a new allocation. This will then be released after the
-    ///   next submission finishes. To entirely avoid short-lived allocations, you might
-    ///   be able to use [`StagingBelt`](crate::util::StagingBelt),
+    /// * Native platforms reuse completed staging allocations within a bounded
+    ///   pool. Each outstanding write needs independent staging memory until its
+    ///   submission completes. To suballocate many writes from larger buffers, use
+    ///   [`StagingBelt`](crate::util::StagingBelt),
     ///   or buffers you explicitly create, map, and unmap yourself.
     pub fn write_buffer(&self, buffer: &Buffer, offset: BufferAddress, data: &[u8]) {
         self.inner.write_buffer(&buffer.inner, offset, data);
@@ -210,9 +210,10 @@ impl Queue {
     ///   explicitly submitted commands. To get a set of scheduled transfers started
     ///   immediately, it's fine to call `queue.submit([])` with no command buffers at all.
     ///
-    /// * Currently on native platforms, the staging memory will be a new allocation, which will
-    ///   then be released after the next submission finishes. To entirely avoid short-lived
-    ///   allocations, you might be able to use [`StagingBelt`](crate::util::StagingBelt),
+    /// * Native platforms reuse completed staging allocations within a bounded
+    ///   pool. Each outstanding write needs independent staging memory until its
+    ///   submission completes. To suballocate many writes from larger buffers, use
+    ///   [`StagingBelt`](crate::util::StagingBelt),
     ///   or buffers you explicitly create, map, and unmap yourself.
     #[must_use]
     pub fn write_buffer_with(

@@ -11,7 +11,7 @@ use core::{
     mem::{self, size_of, ManuallyDrop},
     num::NonZeroU64,
     ops::Range,
-    ptr::NonNull,
+    ptr::{read, NonNull},
 };
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -1475,18 +1475,17 @@ unsafe impl Sync for StagingBuffer {}
 
 /// A temporary buffer, consumed by the command that uses it.
 ///
-/// A [`StagingBuffer`] is designed for one-shot uploads of data to the GPU. It
-/// is always created mapped, and the command that uses it destroys the buffer
-/// when it is done.
+/// A [`StagingBuffer`] supplies mapped memory for one upload to the GPU. Its
+/// allocation can be reused only after the upload's submission has completed.
 ///
 /// [`StagingBuffer`]s can be created with [`Queue::create_staging_buffer`] and
 /// used with [`Queue::write_staging_buffer`]. They are also used internally by
 /// operations like [`Queue::write_texture`] that need to upload data to the GPU,
 /// but that don't belong to any particular wgpu command buffer.
 ///
-/// Used `StagingBuffer`s are accumulated in [`Device::pending_writes`], to be
-/// freed once their associated operation's queue submission has finished
-/// execution.
+/// Used `StagingBuffer`s are accumulated in [`Device::pending_writes`], then
+/// retained by their submission until completion. The lifetime tracker retains a
+/// bounded pool of completed allocations and destroys allocations it cannot retain.
 ///
 /// [`Queue::create_staging_buffer`]: crate::device::queue::Queue::create_staging_buffer
 /// [`Queue::write_staging_buffer`]: crate::device::queue::Queue::write_staging_buffer
@@ -1513,8 +1512,13 @@ impl StagingBuffer {
 
         let (raw, _) = unsafe { device.raw().create_buffer(&stage_desc) }
             .map_err(|e| device.handle_hal_error(e))?;
-        let mapping = unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) }
-            .map_err(|e| device.handle_hal_error(e))?;
+        let mapping = match unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) } {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                unsafe { device.raw().destroy_buffer(raw) };
+                return Err(device.handle_hal_error(error));
+            }
+        };
 
         let staging_buffer = StagingBuffer {
             raw,
@@ -1649,6 +1653,31 @@ pub struct FlushedStagingBuffer {
 impl FlushedStagingBuffer {
     pub(crate) fn raw(&self) -> &dyn hal::DynBuffer {
         self.raw.as_ref()
+    }
+
+    /// Remaps an allocation returned by the completed-submission staging pool.
+    ///
+    /// # Safety
+    /// All GPU accesses must have completed and every native command buffer
+    /// referencing this allocation must have been reset.
+    pub(crate) unsafe fn remap(self) -> Result<StagingBuffer, DeviceError> {
+        // SAFETY: The lifetime tracker has observed GPU completion and reset the
+        // owning encoder. This MAP_WRITE allocation is unmapped and exclusively
+        // owned here; the full nonempty range is within its original allocation.
+        let mapping = unsafe { self.device.raw().map_buffer(self.raw(), 0..self.size.get()) }
+            .map_err(|error| self.device.handle_hal_error(error))?;
+        let size = self.size;
+        let mut buffer = ManuallyDrop::new(self);
+        // SAFETY: Both owners move into StagingBuffer exactly once. The consumed
+        // wrapper is never dropped or accessed again, so neither owner is released.
+        let (raw, device) = unsafe { (ManuallyDrop::take(&mut buffer.raw), read(&buffer.device)) };
+        Ok(StagingBuffer {
+            raw,
+            device,
+            size,
+            is_coherent: mapping.is_coherent,
+            ptr: mapping.ptr,
+        })
     }
 }
 

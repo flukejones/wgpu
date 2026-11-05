@@ -887,7 +887,7 @@ impl Queue {
         // Platform validation requires that the staging buffer always be
         // freed, even if an error occurs. All paths from here must call
         // `device.pending_writes.consume`.
-        let mut staging_buffer = StagingBuffer::new(&self.device, data_size)?;
+        let (mut staging_buffer, _) = self.create_staging_buffer(data_size)?;
 
         let staging_buffer = {
             profiling::scope!("copy");
@@ -932,7 +932,13 @@ impl Queue {
 
         self.device.check_is_valid()?;
 
-        let staging_buffer = StagingBuffer::new(&self.device, buffer_size)?;
+        let recycled = self.lock_life().take_staging_buffer(buffer_size);
+        let staging_buffer = match recycled {
+            // SAFETY: Only triaged submissions whose encoders have been reset
+            // return allocations to the lifetime tracker's staging pool.
+            Some(buffer) => unsafe { buffer.remap()? },
+            None => StagingBuffer::new(&self.device, buffer_size)?,
+        };
         let ptr = unsafe { staging_buffer.ptr() };
 
         Ok((staging_buffer, ptr))
